@@ -3,6 +3,7 @@ Math Task Analyzer – core logic for batch processing math tasks with LLM.
 No Streamlit dependency – can be used standalone or imported.
 """
 
+import io
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -67,7 +68,7 @@ def parse_extra_columns(text: str) -> list[tuple[str, str]]:
         line = line.strip()
         if not line:
             continue
-        for sep in (" — ", " - "):
+        for sep in (" — ", " -- "):
             if sep in line:
                 name, _, definition = line.partition(sep)
                 cols.append((name.strip(), definition.strip()))
@@ -108,6 +109,41 @@ def load_txt_files(uploaded_files) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame(columns=["row_idx", "source_file", "task_text"])
     df = pd.DataFrame(rows).sort_values("source_file").reset_index(drop=True)
+    df.insert(0, "row_idx", df.index)
+    return df
+
+
+def load_tsv_file(uploaded_file) -> pd.DataFrame:
+    """Parse an uploaded TSV with 'file' and 'text' columns → DataFrame[row_idx, source_file, task_text].
+
+    Raises ValueError if required columns are missing.
+    """
+    raw = uploaded_file.read()
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8-sig", errors="replace")
+    df_raw = pd.read_csv(io.StringIO(raw), sep="\t")
+
+    missing = {"file", "text"} - set(df_raw.columns)
+    if missing:
+        raise ValueError(
+            f"TSV is missing required column(s): {', '.join(sorted(missing))}. "
+            f"Found columns: {', '.join(df_raw.columns)}"
+        )
+
+    df = pd.DataFrame(
+        {
+            "source_file": df_raw["file"].astype(str).str.strip(),
+            "task_text": (
+                df_raw["text"]
+                .fillna("")
+                .astype(str)
+                .str.replace("\t", " ")
+                .str.strip()
+            ),
+        }
+    )
+    df = df[df["task_text"] != ""].reset_index(drop=True)
+    df = df.sort_values("source_file").reset_index(drop=True)
     df.insert(0, "row_idx", df.index)
     return df
 

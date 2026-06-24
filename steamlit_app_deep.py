@@ -23,6 +23,7 @@ from math_task_analyzer import (
     get_result_columns,
     get_encoder,
     load_txt_files,
+    load_tsv_file,
     create_batches,
     compute_token_stats,
     combine_results,
@@ -162,18 +163,56 @@ with st.sidebar:
     )
 
 # ── File upload ───────────────────────────────
-uploaded = st.file_uploader(
-    "Upload .txt task files (one task per line)",
-    type=["txt"],
-    accept_multiple_files=True,
+input_mode = st.radio(
+    "Input source",
+    options=["📄 .txt files", "📊 TSV file (columns: file, text)"],
+    horizontal=True,
 )
 
-if not uploaded:
-    st.info("👆 Upload one or more `.txt` files to get started.")
-    st.stop()
+df_in = None
 
-df_in = load_txt_files(uploaded)
-st.success(f"Loaded **{len(df_in)}** tasks from **{len(uploaded)}** file(s).")
+if input_mode == "📄 .txt files":
+    uploaded = st.file_uploader(
+        "Upload .txt task files (one task per line)",
+        type=["txt"],
+        accept_multiple_files=True,
+    )
+
+    if not uploaded:
+        st.info("👆 Upload one or more `.txt` files to get started.")
+        st.stop()
+
+    df_in = load_txt_files(uploaded)
+    st.success(f"Loaded **{len(df_in)}** tasks from **{len(uploaded)}** file(s).")
+
+else:
+    uploaded_tsv = st.file_uploader(
+        "Upload a TSV file with columns 'file' and 'text'",
+        type=["tsv"],
+        accept_multiple_files=False,
+    )
+
+    if not uploaded_tsv:
+        st.info(
+            "👆 Upload a `.tsv` file with a **`file`** column (source name) "
+            "and a **`text`** column (task text)."
+        )
+        st.stop()
+
+    try:
+        df_in = load_tsv_file(uploaded_tsv)
+    except ValueError as e:
+        st.error(f"❌ {e}")
+        st.stop()
+
+    if df_in.empty:
+        st.warning("The TSV was parsed but contained no non-empty rows.")
+        st.stop()
+
+    st.success(
+        f"Loaded **{len(df_in)}** tasks from TSV "
+        f"(**{df_in['source_file'].nunique()}** distinct file value(s))."
+    )
 
 # Show token and batch statistics using current batch settings
 encoder = get_encoder(model)
