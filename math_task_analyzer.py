@@ -68,7 +68,7 @@ def parse_extra_columns(text: str) -> list[tuple[str, str]]:
         line = line.strip()
         if not line:
             continue
-        for sep in (" — ", " -- "):
+        for sep in (" — ", " - "):
             if sep in line:
                 name, _, definition = line.partition(sep)
                 cols.append((name.strip(), definition.strip()))
@@ -308,9 +308,29 @@ def combine_results(
         df, warns = parse_llm_response(batch_idx, text, expected_columns)
         all_warnings.extend(warns)
         if not df.empty:
-            # Ensure row_idx is numeric for proper merging later
+            # Ensure row_idx is numeric for proper merging later.
+            # The LLM sometimes returns row_idx with stray characters
+            # (e.g. "2)", " 2 ", "Row 2") — strip everything except
+            # digits/minus sign before coercing, so a row's data never
+            # gets silently orphaned from its row_idx.
             if "row_idx" in df.columns:
-                df["row_idx"] = pd.to_numeric(df["row_idx"], errors="coerce")
+                cleaned = (
+                    df["row_idx"]
+                    .astype(str)
+                    .str.extract(r"(-?\d+)", expand=False)
+                )
+                numeric = pd.to_numeric(cleaned, errors="coerce")
+                bad_mask = numeric.isna()
+                if bad_mask.any():
+                    bad_originals = df.loc[bad_mask, "row_idx"].tolist()
+                    all_warnings.append(
+                        f"Batch {batch_idx}: {bad_mask.sum()} row(s) had an "
+                        f"unparseable row_idx ({bad_originals}) — dropped, "
+                        f"will show as missing and can be re-run."
+                    )
+                df = df.loc[~bad_mask].copy()
+                df["row_idx"] = numeric.loc[~bad_mask]
+        if not df.empty:
             frames.append(df)
 
     if not frames:
