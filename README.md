@@ -1,4 +1,4 @@
-# 🧮 Math Task Batch Classifier
+# 🧮 Math Task Batch Analyzer
 
 Upload `.txt` files with math problems → send to LLM in batches → get a structured table (TSV/DataFrame) with custom columns.
 
@@ -27,7 +27,7 @@ Perfect for teachers, researchers, or anyone who needs to classify many math tas
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/your-username/math-task-classifier.git
+git clone https://github.com/your-username/math-task-analyzer.git
 cd math-task-classifier
 2. Install dependencies
 ```bash
