@@ -68,7 +68,7 @@ def parse_extra_columns(text: str) -> list[tuple[str, str]]:
         line = line.strip()
         if not line:
             continue
-        for sep in (" — ", " - "):
+        for sep in (" — ", " -- "):
             if sep in line:
                 name, _, definition = line.partition(sep)
                 cols.append((name.strip(), definition.strip()))
