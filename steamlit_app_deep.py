@@ -85,12 +85,12 @@ def build_debug_zip(
 # ─────────────────────────────────────────────
 
 st.set_page_config(
-    page_title="Math Task Classifier",
+    page_title="Math Task Analyzer",
     page_icon="🧮",
     layout="wide",
 )
 
-st.title("🧮 Math Task Batch Classifier")
+st.title("🧮 Math Task Batch Analyzer")
 st.caption("Upload .txt files → batch-send to LLM → structured DataFrame")
 
 # ── Sidebar ──────────────────────────────────
