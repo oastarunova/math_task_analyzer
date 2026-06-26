@@ -143,17 +143,37 @@ with st.sidebar:
     max_tokens_batch = st.number_input(
         "Max input tokens/batch",
         min_value=500,
-        max_value=32000,
+        max_value=320000,
         value=DEFAULT_MAX_TOKENS_PER_BATCH,
         step=500,
     )
-    max_response_tokens = st.number_input(
-        "Max response tokens",
-        min_value=256,
-        max_value=32000,
-        value=8000,
-        step=256,
+
+    auto_response_tokens = st.checkbox(
+        "Auto-size response tokens per batch (recommended)",
+        value=True,
+        help=(
+            "Since the LLM echoes back the task text plus a few short "
+            "column fills, output size scales with input size. With this "
+            "on, each batch gets its own cap computed from its own input "
+            "tokens + a per-row overhead for the extra columns, instead "
+            "of one flat number that may be too small for big batches "
+            "(truncation) or wastefully large for small ones."
+        ),
     )
+    if auto_response_tokens:
+        max_response_tokens = "auto"
+        st.caption(
+            "Response cap = batch input tokens + (rows × extra columns × ~12 "
+            "tokens) × 1.25 safety margin."
+        )
+    else:
+        max_response_tokens = st.number_input(
+            "Max response tokens",
+            min_value=256,
+            max_value=32000,
+            value=8000,
+            step=256,
+        )
     temperature = st.slider("Temperature", 0.0, 2.0, 1.0, 0.05)
     max_workers = st.number_input(
         "Parallel workers",
@@ -272,9 +292,13 @@ if st.button("🚀 Send to LLM", type="primary", disabled=not api_key):
         columns_prompt=columns_prompt,
         model=model,
         temperature=temperature,
-        max_response_tokens=int(max_response_tokens),
+        max_response_tokens=(
+            "auto" if max_response_tokens == "auto" else int(max_response_tokens)
+        ),
         max_workers=int(max_workers),
         progress_callback=update_progress,
+        encoder=encoder,
+        num_extra_columns=len(extra_cols),
     )
 
     elapsed = time.time() - t0
@@ -353,7 +377,7 @@ if st.session_state.run_done:
         # Re-run missed tasks
         missed_row_idxs = (
             set(df_in["row_idx"]) - set(df_result["row_idx"])
-            if not df_result.empty
+            if not df_result.empty and "row_idx" in df_result.columns
             else set(df_in["row_idx"])
         )
         if missing > 0 and missed_row_idxs:
@@ -382,9 +406,15 @@ if st.session_state.run_done:
                         columns_prompt=columns_prompt_saved,
                         model=model,
                         temperature=temperature,
-                        max_response_tokens=int(max_response_tokens),
+                        max_response_tokens=(
+                            "auto"
+                            if max_response_tokens == "auto"
+                            else int(max_response_tokens)
+                        ),
                         max_workers=int(max_workers),
                         progress_callback=update_missed,
+                        encoder=encoder,
+                        num_extra_columns=max(len(result_columns_saved) - 2, 0),
                     )
                     # Use result_columns_saved (list of column names)
                     missed_df, missed_warnings = combine_results(

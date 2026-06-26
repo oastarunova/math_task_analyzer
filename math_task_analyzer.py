@@ -16,8 +16,8 @@ from openai import OpenAI
 # ─────────────────────────────────────────────
 
 DEFAULT_BASE_URL = "https://api.deepseek.com"
-DEFAULT_MODEL = "deepseek-chat"
-DEFAULT_MAX_TOKENS_PER_BATCH = 4000
+DEFAULT_MODEL = "deepseek-v4-flash"
+DEFAULT_MAX_TOKENS_PER_BATCH = 40000
 DEFAULT_MAX_WORKERS = 5
 TIKTOKEN_FALLBACK = "cl100k_base"
 
@@ -188,6 +188,42 @@ def compute_token_stats(df_in: pd.DataFrame, encoder, max_tokens_batch: int):
     return total_tokens, len(batches)
 
 
+def estimate_response_tokens(
+    batch_text: str,
+    encoder,
+    num_extra_columns: int,
+    overhead_per_row: int = 12,
+    safety_factor: float = 1.25,
+    min_tokens: int = 256,
+    max_tokens_ceiling: int = 320000,
+) -> int:
+    """
+    Estimate a safe max_response_tokens for a single batch, derived from
+    that batch's own input size — not a flat global guess.
+
+    Rationale: the model is asked to echo back the task text (≈ same
+    token count as the input) plus fill in a small number of short
+    extra-column values per row (each typically a short word/name or
+    '-', ~overhead_per_row tokens). So:
+
+        output_tokens ≈ input_tokens + num_rows * num_extra_columns * overhead_per_row
+
+    A safety_factor multiplier covers natural variance (slightly longer
+    fills, typo corrections that add a word, tokenizer mismatches
+    between tiktoken's estimate and the actual model tokenizer, etc.)
+    without resorting to one giant flat ceiling for every batch
+    regardless of size.
+    """
+    lines = [l for l in batch_text.splitlines() if l.strip()]
+    num_rows = max(len(lines) - 1, 0)  # minus header
+    input_tokens = len(encoder.encode(batch_text))
+
+    estimate = input_tokens + num_rows * num_extra_columns * overhead_per_row
+    estimate = int(estimate * safety_factor)
+
+    return max(min_tokens, min(estimate, max_tokens_ceiling))
+
+
 def call_llm(
     client: OpenAI,
     batch_idx: int,
@@ -198,7 +234,13 @@ def call_llm(
     temperature: float,
     max_response_tokens: int,
 ) -> tuple[int, str]:
-    """Send one batch to the LLM. Returns (batch_idx, response_text)."""
+    """Send one batch to the LLM. Returns (batch_idx, response_text).
+
+    If the response was cut short because max_response_tokens was hit
+    (finish_reason == "length"), a "TRUNCATED:" marker is prepended so
+    parse_llm_response/combine_results can flag it distinctly from a
+    generic malformed response.
+    """
     try:
         resp = client.chat.completions.create(
             model=model,
@@ -218,7 +260,11 @@ def call_llm(
             max_tokens=max_response_tokens,
             stream=False,
         )
-        return batch_idx, resp.choices[0].message.content
+        content = resp.choices[0].message.content
+        finish_reason = resp.choices[0].finish_reason
+        if finish_reason == "length":
+            content = f"TRUNCATED:{content}"
+        return batch_idx, content
     except Exception as e:
         return batch_idx, f"ERROR: {e}"
 
@@ -240,6 +286,17 @@ def parse_llm_response(
     if text.startswith("ERROR:"):
         warnings.append(f"Batch {batch_idx}: API error — {text}")
         return pd.DataFrame(), warnings
+
+    truncated = text.startswith("TRUNCATED:")
+    if truncated:
+        text = text[len("TRUNCATED:"):]
+        warnings.append(
+            f"Batch {batch_idx}: response was TRUNCATED — it hit "
+            f"max_response_tokens before finishing. The last row (and any "
+            f"rows after it) may be cut off mid-line and will be skipped "
+            f"or missing. Raise max_response_tokens or lower the input "
+            f"batch size to fix this for good."
+        )
 
     # Remove markdown fences
     text = re.sub(r"```[^\n]*\n?", "", text).strip()
@@ -307,29 +364,40 @@ def combine_results(
     for batch_idx, text in raw_results:
         df, warns = parse_llm_response(batch_idx, text, expected_columns)
         all_warnings.extend(warns)
-        if not df.empty:
-            # Ensure row_idx is numeric for proper merging later.
-            # The LLM sometimes returns row_idx with stray characters
-            # (e.g. "2)", " 2 ", "Row 2") — strip everything except
-            # digits/minus sign before coercing, so a row's data never
-            # gets silently orphaned from its row_idx.
-            if "row_idx" in df.columns:
-                cleaned = (
-                    df["row_idx"]
-                    .astype(str)
-                    .str.extract(r"(-?\d+)", expand=False)
-                )
-                numeric = pd.to_numeric(cleaned, errors="coerce")
-                bad_mask = numeric.isna()
-                if bad_mask.any():
-                    bad_originals = df.loc[bad_mask, "row_idx"].tolist()
-                    all_warnings.append(
-                        f"Batch {batch_idx}: {bad_mask.sum()} row(s) had an "
-                        f"unparseable row_idx ({bad_originals}) — dropped, "
-                        f"will show as missing and can be re-run."
-                    )
-                df = df.loc[~bad_mask].copy()
-                df["row_idx"] = numeric.loc[~bad_mask]
+
+        if df.empty:
+            continue
+
+        if "row_idx" not in df.columns:
+            # The whole batch is unusable without row_idx — every row
+            # would be unmergeable/orphaned. Drop the batch entirely
+            # rather than silently appending a frame that breaks the
+            # later concat/drop_duplicates/merge steps.
+            all_warnings.append(
+                f"Batch {batch_idx}: response was missing the 'row_idx' "
+                f"column entirely — whole batch dropped, rows will show "
+                f"as missing and can be re-run."
+            )
+            continue
+
+        # Ensure row_idx is numeric for proper merging later.
+        # The LLM sometimes returns row_idx with stray characters
+        # (e.g. "2)", " 2 ", "Row 2") — strip everything except
+        # digits/minus sign before coercing, so a row's data never
+        # gets silently orphaned from its row_idx.
+        cleaned = df["row_idx"].astype(str).str.extract(r"(-?\d+)", expand=False)
+        numeric = pd.to_numeric(cleaned, errors="coerce")
+        bad_mask = numeric.isna()
+        if bad_mask.any():
+            bad_originals = df.loc[bad_mask, "row_idx"].tolist()
+            all_warnings.append(
+                f"Batch {batch_idx}: {bad_mask.sum()} row(s) had an "
+                f"unparseable row_idx ({bad_originals}) — dropped, "
+                f"will show as missing and can be re-run."
+            )
+        df = df.loc[~bad_mask].copy()
+        df["row_idx"] = numeric.loc[~bad_mask]
+
         if not df.empty:
             frames.append(df)
 
@@ -337,9 +405,8 @@ def combine_results(
         return pd.DataFrame(), all_warnings
 
     combined = pd.concat(frames, ignore_index=True)
-    # Drop duplicate row_idx, keep last occurrence (most recent batch)
-    if "row_idx" in combined.columns:
-        combined = combined.drop_duplicates(subset=["row_idx"], keep="last")
+    # Every frame here is guaranteed to have row_idx, so this is now safe.
+    combined = combined.drop_duplicates(subset=["row_idx"], keep="last")
     return combined, all_warnings
 
 
@@ -350,18 +417,35 @@ def run_batches(
     columns_prompt: str,
     model: str,
     temperature: float,
-    max_response_tokens: int,
+    max_response_tokens,
     max_workers: int,
     progress_callback=None,
+    encoder=None,
+    num_extra_columns: int = 0,
 ) -> list[tuple[int, str]]:
     """
     Run all batches in parallel.
     If progress_callback is provided, it will be called after each batch with (done, total).
+
+    max_response_tokens can be:
+      - an int: used as a fixed cap for every batch (old behavior).
+      - "auto": each batch gets its own cap computed by
+        estimate_response_tokens() from that batch's own input size and
+        num_extra_columns, instead of one flat guess for every batch
+        regardless of size. Requires `encoder` to be passed.
+
     Returns sorted list of (batch_idx, response_text).
     """
     results = []
     total = len(batches)
     done = 0
+
+    def resolve_cap(batch_text: str) -> int:
+        if max_response_tokens == "auto":
+            return estimate_response_tokens(
+                batch_text, encoder, num_extra_columns
+            )
+        return max_response_tokens
 
     with ThreadPoolExecutor(max_workers=max_workers) as exe:
         futures = {
@@ -374,7 +458,7 @@ def run_batches(
                 columns_prompt,
                 model,
                 temperature,
-                max_response_tokens,
+                resolve_cap(text),
             ): idx
             for idx, text in batches
         }
