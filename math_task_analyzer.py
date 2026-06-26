@@ -32,9 +32,12 @@ DEFAULT_SYSTEM_PROMPT = """\
 3. Для отсутствующей информации используй символ '-'. Не добавляй поля, не указанные в списке.
 
 ТРЕБОВАНИЯ К ВЫВОДУ:
-- Только CSV с разделителем табуляции (\\t).
-- Первой строкой — заголовки столбцов точно как указано в разделе КОЛОНКИ.
+- Только CSV, где столбцы разделены символом табуляции (TAB) — нажатием клавиши Tab, а НЕ двумя символами "\\" и "t".
+- Первой строкой — заголовки столбцов точно как указано в разделе КОЛОНКИ (без префиксов-номеров).
 - Каждая следующая строка — результат обработки одной задачи из входных данных.
+- В строках данных (не в заголовке) каждое значение должно начинаться с номера своей колонки и дефиса: "N-значение", где N — порядковый номер колонки (1, 2, 3…), считая от начала строки в разделе КОЛОНКИ. Пример строки для колонок 1=row_idx, 2=Текст задачи (между значениями — настоящий символ табуляции, не текст "\\t"):
+1-3	2-Текст задачи...
+  Это нужно для проверки, что порядок колонок не нарушен.
 - Без дополнительных комментариев, пояснений или форматирования вне таблицы.
 - Все перечисления — через запятую.
 - Сохраняй оригинальный текст задачи (только исправь опечатки).
@@ -148,8 +151,16 @@ def load_tsv_file(uploaded_file) -> pd.DataFrame:
     return df
 
 
-def create_batches(df: pd.DataFrame, encoder, max_tokens: int) -> list[tuple[int, str]]:
-    """Split df into token-limited TSV batches. Returns [(batch_idx, tsv_text), ...]."""
+def create_batches(
+    df: pd.DataFrame, encoder, max_tokens: int, start_idx: int = 0
+) -> list[tuple[int, str]]:
+    """Split df into token-limited TSV batches. Returns [(batch_idx, tsv_text), ...].
+
+    start_idx: first batch_idx to use (default 0). Pass the next free index
+    (e.g. len of the original batches) when re-running missed tasks, so the
+    re-run's batches get fresh, non-colliding numbers instead of restarting
+    at 0 and overwriting/aliasing the original batch 0, 1, 2…
+    """
     if df.empty:
         return []
 
@@ -157,7 +168,7 @@ def create_batches(df: pd.DataFrame, encoder, max_tokens: int) -> list[tuple[int
     header = "\t".join(send_cols)
     lines = [f"{row.row_idx}\t{row.task_text}" for row in df.itertuples()]
 
-    batches, current, current_tok, batch_idx = [], [], 0, 0
+    batches, current, current_tok, batch_idx = [], [], 0, start_idx
 
     for line in lines:
         toks = len(encoder.encode(line))
@@ -269,6 +280,23 @@ def call_llm(
         return batch_idx, f"ERROR: {e}"
 
 
+def _strip_column_prefix(value: str, col_pos_1based: int) -> tuple[str, bool]:
+    """
+    Strip the expected 'N-' column-index prefix from a value.
+
+    Returns (clean_value, ok). ok is False if the value did not start with
+    the exact expected prefix "{col_pos_1based}-" — meaning the LLM put the
+    column in the wrong slot (or skipped/duplicated a column), which is
+    exactly the misalignment this prefix scheme is meant to catch. When
+    ok is False, value is returned unchanged (best-effort) so no data
+    silently disappears, but callers should warn loudly.
+    """
+    prefix = f"{col_pos_1based}-"
+    if value.startswith(prefix):
+        return value[len(prefix):], True
+    return value, False
+
+
 def parse_llm_response(
     batch_idx: int,
     text: str,
@@ -278,6 +306,13 @@ def parse_llm_response(
     Parse TSV response from LLM. Never skips an entire batch.
     Uses expected_columns as the DataFrame columns (ignores LLM's header if malformed).
     Only rows with exactly len(expected_columns) fields are kept.
+
+    Each data-row value is expected to carry an "N-" column-index prefix
+    (N = 1-based column position) as a column-order sanity check — see
+    DEFAULT_SYSTEM_PROMPT. Prefixes are verified and stripped here; a
+    mismatch flags likely column misalignment for that row without
+    dropping the row outright.
+
     Returns (df, warnings).
     """
     warnings = []
@@ -306,7 +341,9 @@ def parse_llm_response(
         warnings.append(f"Batch {batch_idx}: response had fewer than 2 lines, skipped.")
         return pd.DataFrame(), warnings
 
-    # Extract header (first non-empty line) – we may or may not use it
+    # Extract header (first non-empty line) – we may or may not use it.
+    # The header itself is NOT expected to carry "N-" prefixes (only data
+    # rows are), so it's matched/validated as plain column names.
     header_line = lines[0]
     header_cols = header_line.split("\t")
     use_llm_header = (
@@ -327,12 +364,56 @@ def parse_llm_response(
     good_rows = []
     for i, line in enumerate(lines[1:], start=2):
         parts = line.split("\t")
+        if len(parts) == 1 and "\\t" in line:
+            # The model echoed the literal two characters "\" + "t" instead
+            # of a real tab byte — recover the row instead of losing it.
+            recovered = line.split("\\t")
+            if len(recovered) == expected_col_count:
+                parts = recovered
+                warnings.append(
+                    f"Batch {batch_idx}, line {i}: row used literal '\\\\t' "
+                    f"instead of a real tab — recovered automatically."
+                )
+        if len(parts) == expected_col_count + 1 and parts[-1] == "":
+            # Model added one stray trailing tab after the last column's
+            # value, producing a harmless empty extra field. Drop it rather
+            # than skipping a row that's otherwise complete and correct.
+            parts = parts[:-1]
+            warnings.append(
+                f"Batch {batch_idx}, line {i}: stripped a trailing empty "
+                f"field caused by a trailing tab — recovered automatically."
+            )
         if len(parts) != expected_col_count:
             warnings.append(
                 f"Batch {batch_idx}, line {i}: {len(parts)} columns (expected {expected_col_count}) — row skipped."
             )
-        else:
-            good_rows.append(parts)
+            continue
+
+        # Verify + strip the "N-" column-index prefix on every value.
+        # A mismatch here means the value isn't actually in the column
+        # position it claims to be in (model shifted/dropped a field) —
+        # the row is still kept (best-effort) but flagged, rather than
+        # silently trusting raw column position.
+        cleaned_parts = []
+        bad_cols = []
+        for col_pos, part in enumerate(parts, start=1):
+            clean, ok = _strip_column_prefix(part, col_pos)
+            cleaned_parts.append(clean)
+            if not ok:
+                bad_cols.append(col_pos)
+
+        if bad_cols:
+            bad_names = [
+                expected_columns[p - 1] if p - 1 < expected_col_count else f"col{p}"
+                for p in bad_cols
+            ]
+            warnings.append(
+                f"Batch {batch_idx}, line {i}: column-index prefix mismatch "
+                f"at position(s) {bad_cols} ({bad_names}) — likely column "
+                f"misalignment; values kept as-is."
+            )
+
+        good_rows.append(cleaned_parts)
 
     if not good_rows:
         warnings.append(f"Batch {batch_idx}: no valid data rows after column check.")

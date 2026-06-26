@@ -170,7 +170,7 @@ with st.sidebar:
         max_response_tokens = st.number_input(
             "Max response tokens",
             min_value=256,
-            max_value=32000,
+            max_value=320000,
             value=8000,
             step=256,
         )
@@ -387,8 +387,12 @@ if st.session_state.run_done:
 
                 client = OpenAI(api_key=api_key, base_url=base_url)
                 encoder = get_encoder(model)
+                # Continue numbering after the original batches so re-run
+                # batches get fresh, non-colliding indices (no overwriting
+                # batch 0, 1, 2… from the original run in warnings/debug ZIP).
+                next_batch_idx = max((idx for idx, _ in batches), default=-1) + 1
                 missed_batches = create_batches(
-                    df_missed, encoder, int(max_tokens_batch)
+                    df_missed, encoder, int(max_tokens_batch), start_idx=next_batch_idx
                 )
 
                 if missed_batches:
@@ -453,6 +457,12 @@ if st.session_state.run_done:
                     st.session_state.df_merged = new_df_merged
                     st.session_state.raw_results = raw_results + missed_raw
                     st.session_state.warnings = warnings + missed_warnings
+                    # Accumulate the re-run batches too, so: (1) a second
+                    # re-run keeps continuing the numbering instead of
+                    # recomputing next_batch_idx from only the original
+                    # batches, and (2) the debug ZIP / "Batches sent" metric
+                    # reflect the re-run batches as well.
+                    st.session_state.batches = batches + missed_batches
                     st.rerun()
                 else:
                     st.warning("No batches created for missed tasks.")
